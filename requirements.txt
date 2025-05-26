@@ -1,0 +1,28 @@
+# Core ML dependencies
+torch==2.0.1
+torchvision==0.15.2
+onnx==1.14.0
+onnxruntime==1.15.1
+
+# Image processing
+Pillow==10.0.0
+
+# Numerical computing
+numpy==1.24.3
+
+# Web framework for Cerebrium
+fastapi==0.100.0
+uvicorn==0.22.0
+
+# HTTP requests for testing
+requests==2.31.0
+
+# Logging and utilities
+python-json-logger==2.0.7
+
+# Development and testing
+pytest==7.4.0
+pytest-cov==4.1.0
+
+# Additional utilities
+python-multipart==0.0.6

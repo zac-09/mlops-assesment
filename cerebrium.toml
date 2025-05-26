@@ -1,0 +1,5 @@
+[cerebrium.deployment]
+name = "imagenet-classifier"
+
+[cerebrium.hardware]
+compute = "TURING_T4"
