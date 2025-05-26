@@ -244,14 +244,8 @@ class ONNXImageClassifier:
             logger.error(f"Error during top-k prediction: {str(e)}")
             raise
 
-# Factory function for easy model creation
 def create_classifier(model_path: str = "model.onnx") -> ONNXImageClassifier:
-    """
-    Factory function to create ONNX classifier instance.
-    
-    Args:
-        model_path (str): Path to ONNX model file
-        
+    """   
     Returns:
         ONNXImageClassifier: Initialized classifier instance
     """
