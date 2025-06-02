@@ -1,96 +1,321 @@
 #!/usr/bin/env python3
 """
 PyTorch ImageNet classification model implementation.
-This matches the actual ResNet architecture of the provided weights.
+This is the exact implementation that matches the provided model weights.
 """
+
+from typing import Callable, List, Optional, Type, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.transforms as transforms
-import torchvision.models as models
-from PIL import Image
+from torch import Tensor
 import numpy as np
+from torchvision import transforms
+from PIL import Image
 import logging
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class ImageNetClassifier(nn.Module):
-    """
-    PyTorch ImageNet classification model using ResNet18 architecture.
-    This matches the structure of the provided model weights.
-    """
-    
-    def __init__(self, num_classes=1000):
-        """
-        Initialize the ResNet-based model.
-        
-        Args:
-            num_classes (int): Number of output classes (default: 1000 for ImageNet)
-        """
-        super(ImageNetClassifier, self).__init__()
-        
-        # Use ResNet18 architecture to match the provided weights
-        self.resnet = models.resnet18(pretrained=False)
-        
-        # Modify the final layer to ensure correct number of classes
-        if self.resnet.fc.out_features != num_classes:
-            self.resnet.fc = nn.Linear(self.resnet.fc.in_features, num_classes)
-    
-    def forward(self, x):
-        """
-        Forward pass through the model.
-        
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, 3, 224, 224)
-            
-        Returns:
-            torch.Tensor: Output logits of shape (batch_size, num_classes)
-        """
-        return self.resnet(x)
+def conv3x3(
+    in_planes: int,
+    out_planes: int,
+    stride: int = 1,
+    groups: int = 1,
+    dilation: int = 1,
+) -> nn.Conv2d:
+    """3x3 convolution with padding"""
+    return nn.Conv2d(
+        in_planes,
+        out_planes,
+        kernel_size=3,
+        stride=stride,
+        padding=dilation,
+        groups=groups,
+        bias=False,
+        dilation=dilation,
+    )
 
-    def preprocess_numpy(self, image_array):
-        """
-        Preprocess numpy image array for inference.
-        
-        Args:
-            image_array (np.ndarray): Input image array (H, W, C) in range [0, 255]
-            
-        Returns:
-            torch.Tensor: Preprocessed tensor ready for model input
-        """
-        try:
-            # Convert to PIL Image if needed
-            if isinstance(image_array, np.ndarray):
-                if image_array.dtype != np.uint8:
-                    image_array = (image_array * 255).astype(np.uint8)
-                image = Image.fromarray(image_array)
-            else:
-                image = image_array
-            
-            # Define preprocessing transforms
-            preprocess = transforms.Compose([
-                transforms.Resize((224, 224)),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]
+
+def conv1x1(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
+    """1x1 convolution"""
+    return nn.Conv2d(
+        in_planes, out_planes, kernel_size=1, stride=stride, bias=False
+    )
+
+
+class BasicBlock(nn.Module):
+    expansion: int = 1
+
+    def __init__(
+        self,
+        inplanes: int,
+        planes: int,
+        stride: int = 1,
+        downsample: Optional[nn.Module] = None,
+        groups: int = 1,
+        base_width: int = 64,
+        dilation: int = 1,
+        norm_layer: Optional[Callable[..., nn.Module]] = None,
+    ) -> None:
+        super().__init__()
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        if groups != 1 or base_width != 64:
+            raise ValueError(
+                "BasicBlock only supports groups=1 and base_width=64"
+            )
+        if dilation > 1:
+            raise NotImplementedError(
+                "Dilation > 1 not supported in BasicBlock"
+            )
+        # Both self.conv1 and self.downsample layers downsample the input when stride != 1
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.bn1 = norm_layer(planes)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = conv3x3(planes, planes)
+        self.bn2 = norm_layer(planes)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x: Tensor) -> Tensor:
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+
+        return out
+
+
+class Bottleneck(nn.Module):
+    # Bottleneck in torchvision places the stride for downsampling at 3x3 convolution(self.conv2)
+    # while original implementation places the stride at the first 1x1 convolution(self.conv1)
+    # according to "Deep residual learning for image recognition" https://arxiv.org/abs/1512.03385.
+    # This variant is also known as ResNet V1.5 and improves accuracy according to
+    # https://ngc.nvidia.com/catalog/model-scripts/nvidia:resnet_50_v1_5_for_pytorch.
+
+    expansion: int = 4
+
+    def __init__(
+        self,
+        inplanes: int,
+        planes: int,
+        stride: int = 1,
+        downsample: Optional[nn.Module] = None,
+        groups: int = 1,
+        base_width: int = 64,
+        dilation: int = 1,
+        norm_layer: Optional[Callable[..., nn.Module]] = None,
+    ) -> None:
+        super().__init__()
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        width = int(planes * (base_width / 64.0)) * groups
+        # Both self.conv2 and self.downsample layers downsample the input when stride != 1
+        self.conv1 = conv1x1(inplanes, width)
+        self.bn1 = norm_layer(width)
+        self.conv2 = conv3x3(width, width, stride, groups, dilation)
+        self.bn2 = norm_layer(width)
+        self.conv3 = conv1x1(width, planes * self.expansion)
+        self.bn3 = norm_layer(planes * self.expansion)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.stride = stride
+
+    def forward(self, x: Tensor) -> Tensor:
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+        out = self.relu(out)
+
+        out = self.conv3(out)
+        out = self.bn3(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+
+        return out
+
+
+class Classifier(nn.Module):
+    def __init__(
+        self,
+        block: Type[Union[BasicBlock, Bottleneck]] = BasicBlock,
+        layers: List[int] = [2, 2, 2, 2],
+        num_classes: int = 1000,
+        zero_init_residual: bool = False,
+        groups: int = 1,
+        width_per_group: int = 64,
+        replace_stride_with_dilation: Optional[List[bool]] = None,
+        norm_layer: Optional[Callable[..., nn.Module]] = None,
+    ) -> None:
+        super().__init__()
+        if norm_layer is None:
+            norm_layer = nn.BatchNorm2d
+        self._norm_layer = norm_layer
+
+        self.inplanes = 64
+        self.dilation = 1
+        if replace_stride_with_dilation is None:
+            # each element in the tuple indicates if we should replace
+            # the 2x2 stride with a dilated convolution instead
+            replace_stride_with_dilation = [False, False, False]
+        if len(replace_stride_with_dilation) != 3:
+            raise ValueError(
+                "replace_stride_with_dilation should be None "
+                f"or a 3-element tuple, got {replace_stride_with_dilation}"
+            )
+        self.groups = groups
+        self.base_width = width_per_group
+        self.conv1 = nn.Conv2d(
+            3, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False
+        )
+        self.bn1 = norm_layer(self.inplanes)
+        self.relu = nn.ReLU(inplace=True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        self.layer1 = self._make_layer(block, 64, layers[0])
+        self.layer2 = self._make_layer(
+            block,
+            128,
+            layers[1],
+            stride=2,
+            dilate=replace_stride_with_dilation[0],
+        )
+        self.layer3 = self._make_layer(
+            block,
+            256,
+            layers[2],
+            stride=2,
+            dilate=replace_stride_with_dilation[1],
+        )
+        self.layer4 = self._make_layer(
+            block,
+            512,
+            layers[3],
+            stride=2,
+            dilate=replace_stride_with_dilation[2],
+        )
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512 * block.expansion, num_classes)
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(
+                    m.weight, mode="fan_out", nonlinearity="relu"
                 )
-            ])
-            
-            # Apply preprocessing
-            tensor = preprocess(image)
-            
-            # Add batch dimension
-            tensor = tensor.unsqueeze(0)
-            
-            return tensor
-            
-        except Exception as e:
-            logger.error(f"Error in preprocessing: {str(e)}")
-            raise
+            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+        # Zero-initialize the last BN in each residual branch,
+        # so that the residual branch starts with zeros, and each residual block behaves like an identity.
+        # This improves the model by 0.2~0.3% according to https://arxiv.org/abs/1706.02677
+        if zero_init_residual:
+            for m in self.modules():
+                if isinstance(m, Bottleneck) and m.bn3.weight is not None:
+                    nn.init.constant_(m.bn3.weight, 0)  # type: ignore[arg-type]
+                elif isinstance(m, BasicBlock) and m.bn2.weight is not None:
+                    nn.init.constant_(m.bn2.weight, 0)  # type: ignore[arg-type]
+
+    def _make_layer(
+        self,
+        block: Type[Union[BasicBlock, Bottleneck]],
+        planes: int,
+        blocks: int,
+        stride: int = 1,
+        dilate: bool = False,
+    ) -> nn.Sequential:
+        norm_layer = self._norm_layer
+        downsample = None
+        previous_dilation = self.dilation
+        if dilate:
+            self.dilation *= stride
+            stride = 1
+        if stride != 1 or self.inplanes != planes * block.expansion:
+            downsample = nn.Sequential(
+                conv1x1(self.inplanes, planes * block.expansion, stride),
+                norm_layer(planes * block.expansion),
+            )
+
+        layers = []
+        layers.append(
+            block(
+                self.inplanes,
+                planes,
+                stride,
+                downsample,
+                self.groups,
+                self.base_width,
+                previous_dilation,
+                norm_layer,
+            )
+        )
+        self.inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(
+                block(
+                    self.inplanes,
+                    planes,
+                    groups=self.groups,
+                    base_width=self.base_width,
+                    dilation=self.dilation,
+                    norm_layer=norm_layer,
+                )
+            )
+
+        return nn.Sequential(*layers)
+
+    def _forward_impl(self, x: Tensor) -> Tensor:
+        # See note [TorchScript super()]
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.fc(x)
+
+        return x
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self._forward_impl(x)
+
+    def preprocess_numpy(self, img):
+        """Original preprocessing method from the provided code."""
+        resize = transforms.Resize((224, 224))   # must same as here
+        crop = transforms.CenterCrop((224, 224))
+        to_tensor = transforms.ToTensor()
+        normalize = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        img = resize(img)
+        img = crop(img)
+        img = to_tensor(img)
+        img = normalize(img)
+        return img
 
     def predict(self, image_path):
         """
@@ -106,16 +331,8 @@ class ImageNetClassifier(nn.Module):
             # Load and preprocess image
             image = Image.open(image_path).convert('RGB')
             
-            preprocess = transforms.Compose([
-                transforms.Resize((224, 224)),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]
-                )
-            ])
-            
-            input_tensor = preprocess(image).unsqueeze(0)
+            # Use the exact preprocessing from the provided code
+            input_tensor = self.preprocess_numpy(image).unsqueeze(0)
             
             # Set model to evaluation mode
             self.eval()
@@ -123,7 +340,7 @@ class ImageNetClassifier(nn.Module):
             # Perform inference
             with torch.no_grad():
                 outputs = self(input_tensor)
-                probabilities = F.softmax(outputs, dim=1)
+                probabilities = torch.nn.functional.softmax(outputs, dim=1)
                 
                 # Get prediction
                 confidence, predicted = torch.max(probabilities, 1)
@@ -135,6 +352,20 @@ class ImageNetClassifier(nn.Module):
         except Exception as e:
             logger.error(f"Error during prediction: {str(e)}")
             raise
+
+
+# Create the ImageNetClassifier class for backward compatibility
+class ImageNetClassifier(Classifier):
+    """Alias for Classifier to maintain compatibility with existing code."""
+    
+    def __init__(self, num_classes=1000):
+        """Initialize with ResNet18 architecture (BasicBlock, [2, 2, 2, 2])."""
+        super().__init__(
+            block=BasicBlock,
+            layers=[2, 2, 2, 2],
+            num_classes=num_classes
+        )
+
 
 def load_model(weights_path="pytorch_model_weights.pth"):
     """
@@ -172,83 +403,50 @@ def load_model(weights_path="pytorch_model_weights.pth"):
         logger.error(f"Error loading model: {str(e)}")
         raise
 
-def inspect_model_weights(weights_path="pytorch_model_weights.pth"):
-    """
-    Inspect the structure of the model weights to understand the architecture.
-    
-    Args:
-        weights_path (str): Path to model weights
-    """
-    try:
-        if torch.cuda.is_available():
-            state_dict = torch.load(weights_path)
-        else:
-            state_dict = torch.load(weights_path, map_location='cpu')
-        
-        # Handle different weight file formats
-        if 'state_dict' in state_dict:
-            weights = state_dict['state_dict']
-        elif 'model' in state_dict:
-            weights = state_dict['model']
-        else:
-            weights = state_dict
-        
-        logger.info("Model weight keys:")
-        for key in sorted(weights.keys()):
-            logger.info(f"  {key}: {weights[key].shape}")
-            
-        # Determine if it's ResNet architecture
-        if any(key.startswith('layer') for key in weights.keys()):
-            logger.info("Detected ResNet architecture")
-        elif any(key.startswith('features') for key in weights.keys()):
-            logger.info("Detected VGG-like architecture")
-        else:
-            logger.info("Unknown architecture")
-            
-    except Exception as e:
-        logger.error(f"Error inspecting weights: {str(e)}")
 
 # Example usage and testing
 if __name__ == "__main__":
     import os
     
-    # Test model creation
-    logger.info("Creating ImageNet classifier...")
-    model = ImageNetClassifier()
+    # Test model creation using the exact code from the provided implementation
+    logger.info("Creating ImageNet classifier using exact implementation...")
+    mtailor = Classifier(BasicBlock, [2, 2, 2, 2])
     
     # Test with random input
     logger.info("Testing with random input...")
     test_input = torch.randn(1, 3, 224, 224)
-    output = model(test_input)
+    output = mtailor(test_input)
     logger.info(f"Output shape: {output.shape}")
     logger.info(f"Output range: [{output.min().item():.3f}, {output.max().item():.3f}]")
     
-    # Test preprocessing
-    logger.info("Testing preprocessing...")
-    test_image = np.random.randint(0, 255, (224, 224, 3), dtype=np.uint8)
-    preprocessed = model.preprocess_numpy(test_image)
-    logger.info(f"Preprocessed shape: {preprocessed.shape}")
-    
-    # If weights file exists, inspect and test loading
+    # If weights file exists, test loading and prediction
     weights_path = "pytorch_model_weights.pth"
     if os.path.exists(weights_path):
-        logger.info("Inspecting model weights...")
-        inspect_model_weights(weights_path)
-        
         logger.info("Loading pretrained weights...")
         try:
-            model = load_model(weights_path)
+            # Load using the exact method from provided code
+            mtailor.load_state_dict(torch.load(weights_path, map_location='cpu'))
+            mtailor.eval()
             logger.info("Model loaded successfully!")
             
             # Test with provided images if they exist
-            test_images = ["n01440764_tench", "n01667114_mud_turtle"]
+            test_images = ["n01440764_tench", "n01667114_mud_turtle", "n01667114_mud_turtle.JPEG"]
             
             for image_path in test_images:
                 if os.path.exists(image_path):
                     logger.info(f"Testing prediction on {image_path}...")
                     try:
-                        class_id, confidence, probs = model.predict(image_path)
-                        logger.info(f"Predicted class: {class_id}, Confidence: {confidence:.4f}")
+                        img = Image.open(image_path).convert('RGB')
+                        inp = mtailor.preprocess_numpy(img).unsqueeze(0)
+                        res = mtailor.forward(inp)
+                        predicted_class = torch.argmax(res).item()
+                        
+                        logger.info(f"Predicted class: {predicted_class}")
+                        
+                        # Also test with our predict method
+                        class_id, confidence, probs = mtailor.predict(image_path)
+                        logger.info(f"Using predict method - Class: {class_id}, Confidence: {confidence:.4f}")
+                        
                     except Exception as e:
                         logger.error(f"Prediction failed for {image_path}: {str(e)}")
         except Exception as e:
@@ -256,3 +454,4 @@ if __name__ == "__main__":
     else:
         logger.warning(f"Weights file not found: {weights_path}")
         logger.info("Download weights from: https://www.dropbox.com/s/b7641ryzmkceoc9/pytorch_model_weights.pth?dl=0")
+

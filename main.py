@@ -11,6 +11,8 @@ from model import ONNXImageClassifier
 from PIL import Image
 import base64
 import io
+import numpy as np
+from torchvision import transforms
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -33,6 +35,33 @@ def init():
         
     except Exception as e:
         logger.error(f"Failed to load model: {str(e)}")
+        raise
+
+def preprocess_image_exact(image):
+    """
+    Apply the exact same preprocessing as the original PyTorch implementation.
+    This ensures perfect consistency between PyTorch and ONNX inference.
+    """
+    try:
+        # Use the exact same preprocessing pipeline as pytorch_model.py
+        resize = transforms.Resize((224, 224))
+        crop = transforms.CenterCrop((224, 224))
+        to_tensor = transforms.ToTensor()
+        normalize = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        
+        # Apply transforms in exact order
+        image = resize(image)
+        image = crop(image)
+        image = to_tensor(image)
+        image = normalize(image)
+        
+        # Add batch dimension and convert to numpy for ONNX
+        image_array = image.unsqueeze(0).numpy()
+        
+        return image_array
+        
+    except Exception as e:
+        logger.error(f"Error in exact preprocessing: {str(e)}")
         raise
 
 def predict(item):
@@ -86,28 +115,52 @@ def predict(item):
             except Exception as e:
                 return {"error": f"Failed to open image: {str(e)}"}
         
-        # Save image to temporary file for processing
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
-            image.save(temp_file.name, "JPEG")
-            temp_path = temp_file.name
+        # Ensure RGB format
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
         
+        # Method 1: Use the exact preprocessing pipeline (recommended)
         try:
+            # Apply exact same preprocessing as PyTorch model
+            input_tensor = preprocess_image_exact(image)
+            
+            # Run inference directly with ONNX session
+            outputs = classifier.session.run([classifier.output_name], {classifier.input_name: input_tensor})
+            predictions = outputs[0][0]  # Remove batch dimension
+            
+            # Apply softmax to get proper probabilities
+            exp_predictions = np.exp(predictions - np.max(predictions))  # For numerical stability
+            probabilities = exp_predictions / np.sum(exp_predictions)
+            
             # Get prediction
-            class_id, confidence, class_name = classifier.predict(temp_path)
+            class_id = int(np.argmax(probabilities))
+            confidence = float(probabilities[class_id])
+            class_name = f"class_{class_id}"
             
-            result = {
-                "class_id": class_id,
-                "class_name": class_name,
-                "confidence": confidence,
-                "status": "success"
-            }
+        except Exception as preprocessing_error:
+            logger.warning(f"Exact preprocessing failed: {preprocessing_error}, falling back to file-based method")
             
-            logger.info(f"Prediction successful: class_id={class_id}, confidence={confidence:.3f}")
-            return result
+            # Method 2: Fallback to file-based prediction (for compatibility)
+            with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
+                image.save(temp_file.name, "JPEG")
+                temp_path = temp_file.name
             
-        finally:
-            # Clean up temporary file
-            os.unlink(temp_path)
+            try:
+                # Use the model's predict method
+                class_id, confidence, class_name = classifier.predict(temp_path)
+            finally:
+                # Clean up temporary file
+                os.unlink(temp_path)
+        
+        result = {
+            "class_id": class_id,
+            "class_name": class_name,
+            "confidence": confidence,
+            "status": "success"
+        }
+        
+        logger.info(f"Prediction successful: class_id={class_id}, confidence={confidence:.3f}")
+        return result
             
     except Exception as e:
         logger.error(f"Prediction error: {str(e)}")

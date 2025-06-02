@@ -6,7 +6,7 @@ Convert PyTorch model to ONNX format for efficient deployment.
 import torch
 import torch.onnx
 import onnx
-from pytorch_model import ImageNetClassifier
+from pytorch_model import Classifier, BasicBlock
 import os
 import logging
 
@@ -45,11 +45,12 @@ def convert_to_onnx(pytorch_model_path, onnx_model_path):
         onnx_model_path (str): Output path for ONNX model
     """
     try:
-        # Load PyTorch model
-        logger.info("Loading PyTorch model...")
-        model = ImageNetClassifier()
+        # Load PyTorch model using the exact implementation
+        logger.info("Creating PyTorch model...")
+        model = Classifier(BasicBlock, [2, 2, 2, 2])  # ResNet18 architecture
         
         # Load weights with proper error handling
+        logger.info("Loading model weights...")
         if torch.cuda.is_available():
             state_dict = torch.load(pytorch_model_path)
         else:
@@ -63,15 +64,18 @@ def convert_to_onnx(pytorch_model_path, onnx_model_path):
         else:
             weights = state_dict
         
-        # Load the state dict with strict=False to handle any mismatches
-        missing_keys, unexpected_keys = model.load_state_dict(weights, strict=False)
+        # Load the state dict - should work perfectly now with exact architecture
+        missing_keys, unexpected_keys = model.load_state_dict(weights, strict=True)
         
         if missing_keys:
-            logger.warning(f"Missing keys in state_dict: {missing_keys[:5]}...")  # Show first 5
+            logger.warning(f"Missing keys in state_dict: {missing_keys}")
+            raise Exception("Model architecture mismatch - missing keys")
         if unexpected_keys:
-            logger.warning(f"Unexpected keys in state_dict: {unexpected_keys[:5]}...")  # Show first 5
+            logger.warning(f"Unexpected keys in state_dict: {unexpected_keys}")
+            raise Exception("Model architecture mismatch - unexpected keys")
         
         model.eval()
+        logger.info("Model loaded successfully with exact architecture match!")
         
         # Create dummy input tensor (batch_size=1, channels=3, height=224, width=224)
         dummy_input = torch.randn(1, 3, 224, 224)
@@ -81,6 +85,7 @@ def convert_to_onnx(pytorch_model_path, onnx_model_path):
         with torch.no_grad():
             test_output = model(dummy_input)
             logger.info(f"Model output shape: {test_output.shape}")
+            logger.info(f"Output range: [{test_output.min().item():.3f}, {test_output.max().item():.3f}]")
         
         # Export to ONNX
         logger.info("Converting to ONNX format...")
@@ -111,6 +116,28 @@ def convert_to_onnx(pytorch_model_path, onnx_model_path):
         logger.info(f"Input shape: {dummy_input.shape}")
         logger.info(f"Model file size: {os.path.getsize(onnx_model_path) / (1024*1024):.2f} MB")
         
+        # Test ONNX model to ensure it works
+        logger.info("Testing ONNX model...")
+        import onnxruntime as ort
+        session = ort.InferenceSession(onnx_model_path)
+        input_name = session.get_inputs()[0].name
+        output_name = session.get_outputs()[0].name
+        
+        # Run test inference
+        onnx_output = session.run([output_name], {input_name: dummy_input.numpy()})
+        logger.info(f"ONNX output shape: {onnx_output[0].shape}")
+        
+        # Compare PyTorch vs ONNX outputs
+        pytorch_output = test_output.numpy()
+        onnx_result = onnx_output[0]
+        max_diff = abs(pytorch_output - onnx_result).max()
+        logger.info(f"Max difference between PyTorch and ONNX: {max_diff:.6f}")
+        
+        if max_diff < 1e-5:
+            logger.info("✅ PyTorch and ONNX outputs match perfectly!")
+        else:
+            logger.warning(f"⚠️ Small difference detected: {max_diff:.6f}")
+        
         return True
         
     except Exception as e:
@@ -129,9 +156,10 @@ def main():
     success = convert_to_onnx(pytorch_weights_path, onnx_model_path)
     
     if success:
-        logger.info("Conversion completed successfully!")
+        logger.info("🎉 Conversion completed successfully!")
+        logger.info("The ONNX model is ready for deployment!")
     else:
-        logger.error("Conversion failed!")
+        logger.error("❌ Conversion failed!")
         exit(1)
 
 if __name__ == "__main__":

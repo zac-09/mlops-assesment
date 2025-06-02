@@ -9,6 +9,7 @@ from PIL import Image
 import logging
 from typing import Tuple, List, Union
 import os
+from torchvision import transforms
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -17,18 +18,19 @@ logger = logging.getLogger(__name__)
 class ImagePreprocessor:
     """
     Handles image preprocessing for ImageNet classification model.
-    Implements the specific preprocessing steps required by the model.
+    Uses the exact same preprocessing as the original PyTorch implementation.
     """
     
     def __init__(self):
-        # ImageNet normalization parameters
-        self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        self.target_size = (224, 224)
+        # Use the exact same preprocessing pipeline as in pytorch_model.py
+        self.resize = transforms.Resize((224, 224))
+        self.crop = transforms.CenterCrop((224, 224))
+        self.to_tensor = transforms.ToTensor()
+        self.normalize = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     
     def preprocess_image(self, image_path: str) -> np.ndarray:
         """
-        Preprocess image for model inference.
+        Preprocess image for model inference using exact original method.
         
         Args:
             image_path (str): Path to input image
@@ -38,26 +40,16 @@ class ImagePreprocessor:
         """
         try:
             # Load image
-            image = Image.open(image_path)
+            image = Image.open(image_path).convert('RGB')
             
-            # Convert to RGB if needed
-            if image.mode != 'RGB':
-                image = image.convert('RGB')
+            # Apply the exact same preprocessing as pytorch_model.py
+            image = self.resize(image)
+            image = self.crop(image)
+            image = self.to_tensor(image)
+            image = self.normalize(image)
             
-            # Resize to 224x224 using bilinear interpolation
-            image = image.resize(self.target_size, Image.BILINEAR)
-            
-            # Convert to numpy array and normalize to [0, 1]
-            image_array = np.array(image, dtype=np.float32) / 255.0
-            
-            # Normalize using ImageNet mean and std
-            image_array = (image_array - self.mean) / self.std
-            
-            # Convert from HWC to CHW format
-            image_array = np.transpose(image_array, (2, 0, 1))
-            
-            # Add batch dimension
-            image_array = np.expand_dims(image_array, axis=0)
+            # Add batch dimension and convert to numpy
+            image_array = image.unsqueeze(0).numpy()
             
             return image_array
             
@@ -76,28 +68,20 @@ class ImagePreprocessor:
             np.ndarray: Preprocessed image tensor
         """
         try:
-            # Ensure float32 and normalize to [0, 1] if needed
-            if image_array.dtype != np.float32:
-                image_array = image_array.astype(np.float32)
+            # Convert numpy array to PIL Image
+            if image_array.dtype != np.uint8:
+                image_array = (image_array * 255).astype(np.uint8)
             
-            if image_array.max() > 1.0:
-                image_array = image_array / 255.0
+            image = Image.fromarray(image_array)
             
-            # Resize if needed
-            if image_array.shape[:2] != self.target_size:
-                from PIL import Image
-                image_pil = Image.fromarray((image_array * 255).astype(np.uint8))
-                image_pil = image_pil.resize(self.target_size, Image.BILINEAR)
-                image_array = np.array(image_pil, dtype=np.float32) / 255.0
+            # Apply the exact same preprocessing as pytorch_model.py
+            image = self.resize(image)
+            image = self.crop(image)
+            image = self.to_tensor(image)
+            image = self.normalize(image)
             
-            # Normalize using ImageNet mean and std
-            image_array = (image_array - self.mean) / self.std
-            
-            # Convert from HWC to CHW format
-            image_array = np.transpose(image_array, (2, 0, 1))
-            
-            # Add batch dimension
-            image_array = np.expand_dims(image_array, axis=0)
+            # Add batch dimension and convert to numpy
+            image_array = image.unsqueeze(0).numpy()
             
             return image_array
             
@@ -170,16 +154,21 @@ class ONNXImageClassifier:
             Tuple[int, float, str]: (class_id, confidence, class_name)
         """
         try:
-            # Preprocess image
+            # Preprocess image using exact same method as PyTorch version
             input_tensor = self.preprocessor.preprocess_image(image_path)
             
             # Run inference
             outputs = self.session.run([self.output_name], {self.input_name: input_tensor})
             predictions = outputs[0][0]  # Remove batch dimension
             
+            # Apply softmax to get probabilities (like in PyTorch version)
+            import numpy as np
+            exp_predictions = np.exp(predictions - np.max(predictions))  # For numerical stability
+            probabilities = exp_predictions / np.sum(exp_predictions)
+            
             # Get top prediction
-            class_id = int(np.argmax(predictions))
-            confidence = float(np.max(predictions))
+            class_id = int(np.argmax(probabilities))
+            confidence = float(probabilities[class_id])
             class_name = self.class_names[class_id] if class_id < len(self.class_names) else f"unknown_{class_id}"
             
             return class_id, confidence, class_name
@@ -228,13 +217,18 @@ class ONNXImageClassifier:
             outputs = self.session.run([self.output_name], {self.input_name: input_tensor})
             predictions = outputs[0][0]  # Remove batch dimension
             
+            # Apply softmax to get probabilities
+            import numpy as np
+            exp_predictions = np.exp(predictions - np.max(predictions))
+            probabilities = exp_predictions / np.sum(exp_predictions)
+            
             # Get top-k predictions
-            top_k_indices = np.argsort(predictions)[-k:][::-1]
+            top_k_indices = np.argsort(probabilities)[-k:][::-1]
             
             results = []
             for idx in top_k_indices:
                 class_id = int(idx)
-                confidence = float(predictions[idx])
+                confidence = float(probabilities[idx])
                 class_name = self.class_names[class_id] if class_id < len(self.class_names) else f"unknown_{class_id}"
                 results.append((class_id, confidence, class_name))
             
@@ -244,8 +238,14 @@ class ONNXImageClassifier:
             logger.error(f"Error during top-k prediction: {str(e)}")
             raise
 
+# Factory function for easy model creation
 def create_classifier(model_path: str = "model.onnx") -> ONNXImageClassifier:
-    """   
+    """
+    Factory function to create ONNX classifier instance.
+    
+    Args:
+        model_path (str): Path to ONNX model file
+        
     Returns:
         ONNXImageClassifier: Initialized classifier instance
     """
